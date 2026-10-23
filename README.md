@@ -9,6 +9,7 @@ driven from a Linux host over `hdc`. Developed on a HUAWEI MateBook Fold
 |---|---|---|
 | **A. Linux engine apps**: [docs/linux-engine-apps.md](docs/linux-engine-apps.md) | Omarchy's neovim setup and CLI tools inside HarmonyOS's Linux engine, each in a native HarmonyOS window | Works |
 | **B. Whole OS in the Oseasy VM**: [docs/oseasy-whole-os.md](docs/oseasy-whole-os.md) | The complete Omarchy AArch64 OS (its disk, systemd, NetworkManager, SDDM) on a Debian 6.1 kernel in the Oseasy VM app | Boots, with text console and a network root shell; the Hyprland desktop is not displayed yet (see status) |
+| **E. Whole OS in Aetherium on the DevEco emulator**: [docs/emulator-aetherium.md](docs/emulator-aetherium.md) | No HarmonyOS hardware: the complete Omarchy AArch64 OS in a patched Aetherium (QEMU TCG) on DevEco's HarmonyOS 7.0 PC emulator, shown in a HarmonyOS window by a native VNC client | Boots Omarchy's own kernel through Limine to the first-boot wizard and setup on virtio-gpu, all in software emulation; the Hyprland desktop is not verified yet (setup stalls near the end) |
 
 What was tried and why other paths fail: [docs/findings.md](docs/findings.md).
 
@@ -33,6 +34,19 @@ Host tools: bash, python3, curl, unzip, bsdtar (libarchive), cpio, gzip,
 qemu-img, sfdisk/blkid (util-linux), mtools, xorriso, kmod (depmod), make,
 clang (with the `aarch64` target, any recent version), hdc.
 
+## Route E quick start
+
+On a Mac (or any DevEco host) with DevEco Studio, `hdc`, `gh` and `python3`:
+
+```sh
+emulator/10-create-emulator.sh   # HarmonyOS 7.0 2in1 emulator image + instance, boot
+emulator/20-fetch-inputs.sh      # Aetherium HAP (patched by emulator/lib/patch_aetherium.py), Omarchy qcow2, RemoteDesk
+emulator/30-install.sh           # install the HAPs, copy the disk to 下载, forward VNC 15901 and serial 14321
+```
+
+Then create the VM in Aetherium as described in
+[docs/emulator-aetherium.md](docs/emulator-aetherium.md#create-the-vm).
+
 ## Layout
 
 ```
@@ -45,6 +59,10 @@ driver/
   efidrm/          omarchy_efidrm: simpledrm on the EFI framebuffer for the Debian 6.1 kernel
 tools/fold/        hdc helpers: screenshots, taps, keys, typing into the VM, guest shell, file copy
 tools/kbuild/      build out-of-tree arm64 modules against Debian headers with clang
+emulator/          route E: emulator setup, input fetch, Aetherium patch (lib/), install
+tools/emu/         hdc UI helper for the emulator (taps, text, screenshots)
+tools/vnc/         VNC frame grab and key injection (RFB, stdlib only)
+tools/serial/      serial console: Limine menu renderer/driver, root shell runner
 linux-engine/      route A install scripts (run inside the Linux engine container)
 docs/
 ```
