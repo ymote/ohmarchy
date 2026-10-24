@@ -1,0 +1,134 @@
+#!/system/bin/sh
+# Enter the native Arch session from a root shell on the HarmonyOS host.
+#   omarchy                  login shell as ARCH_USER (default builder)
+#   omarchy root             login shell as root
+#   omarchy [root] -c CMD..  run CMD (remaining words joined) in a login shell
+#   omarchy -g APP [ARG..]   start a Wayland app, shown as a window in the
+#                            鸿融 VM's Hyprland (route C) through waypipe
+#   omarchy desktop [start|stop|restart|status]
+#                            Omarchy's Hyprland desktop rendered natively for the
+#                            HarmonyOS display app (com.ohmarchy.display)
+#                            OHMARCHY_VTEST_TCP=172.16.100.1:PORT also serves vtest
+#                            clients from the 鸿融 VM's network (remote virgl);
+#                            OHMARCHY_VTEST_TCP_ALLOW=NET/BITS (tests: 127.0.0.0/8)
+#   omarchy start|stop|status
+# The session is started on demand.
+B=${ARCH_BASE:-$(cd "$(dirname "$0")/.." && pwd)}
+R=$B/arch
+user=${ARCH_USER:-builder}
+
+case "$1" in
+start|stop|status) exec sh "$B/arch.sh" "$1" ;;
+esac
+if [ "$1" = desktop ] && [ "$2" = restart ]; then
+    sh "$0" desktop stop > /dev/null 2>&1
+    exec sh "$0" desktop start
+fi
+# The system D-Bus (bin/ohmarchy-sysbus inside) lives as long as the desktop.
+# The image is mounted only in the session's namespace: check for it there.
+sysbus() {
+    nsenter -t "$(cat "$B/session.pid")" -m -p -- chroot "$R" /usr/bin/env -i PATH=/usr/bin /bin/sh -c \
+        'b=/opt/ohmarchy/bin/ohmarchy-sysbus; [ ! -x $b ] || $b "$0"' "$1" > /dev/null
+}
+if [ "$1" = desktop ] && [ "$2" = stop ] && kill -0 "$(cat "$B/session.pid" 2>/dev/null)" 2>/dev/null; then
+    sh "$0" -c /opt/ohmarchy/bin/ohmarchy-desktop stop
+    sysbus stop
+    # The host GPU server forks a child per client, and on HongMeng a child is not
+    # told when its client goes away (the connection stays ESTAB with no peer): each
+    # desktop restart left one behind (~80 MB). The desktop's clients are gone now.
+    for s in $(pgrep -f "virgl_test_server.*$R/tmp/.virgl_test"); do pkill -P "$s"; done
+    exit 0
+fi
+case "$1" in
+root) user=root; shift ;;
+esac
+cmd= gui=
+case "$1" in
+-c) shift; cmd="$*"; [ -n "$cmd" ] || { echo "omarchy: -c needs a command" >&2; exit 2; } ;;
+desktop)
+    gui=1
+    cmd="/opt/ohmarchy/bin/ohmarchy-desktop ${2:-start}"
+    # the display app's uid: the only one the sound relay serves
+    app_uid=$(bm dump -n com.ohmarchy.display 2>/dev/null | grep -m1 '"uid"' | tr -dc 0-9)
+    [ -n "$app_uid" ] && cmd="OHMARCHY_APP_UID=$app_uid $cmd"
+    # GPU for Hyprland: Mesa's virpipe at /tmp/.virgl_test inside Arch reaches the
+    # host's virglrenderer (zink on the Maleoon GPU). With bin/vtest-broker the
+    # renderer runs in the display app, which presents frames into its window
+    # without reading them back; otherwise (or OHMARCHY_GPU=host) in
+    # bin/virgl_test_server on the host.
+    vtest=$B/bin/vtest-broker
+    [ -x "$vtest" ] && [ "$OHMARCHY_GPU" != host ] || vtest=$B/bin/virgl_test_server
+    if [ "${2:-start}" = start ]; then
+        sh "$B/arch.sh" start > /dev/null || exit 1
+        sysbus start
+    fi
+    if [ "${2:-start}" = start ] && [ -x "$vtest" ]; then
+        P=$(cat "$B/session.pid")
+        sock=$R/tmp/.virgl_test
+        if ! pgrep -f "$vtest" > /dev/null; then
+            pkill -f "$B/bin/v[it][re]" 2>/dev/null   # the other server
+            sleep 0.3
+            case $vtest in
+            # opening the display app (re)starts the desktop for it
+            # only the display app gets the desktop's GPU connections, and the
+            # broker handles them as the desktop user (root only for the restart)
+            *broker) ug=$(grep "^$user:" "/proc/$P/root/etc/passwd" | cut -d: -f3,4)
+                     nsenter -t "$P" -m -- "$vtest" --on-app "sh $B/bin/omarchy desktop restart" \
+                         ${app_uid:+--app-uid "$app_uid"} ${ug:+--user "$ug"} \
+                         ${OHMARCHY_VTEST_TCP:+--tcp "$OHMARCHY_VTEST_TCP"} \
+                         ${OHMARCHY_VTEST_TCP_ALLOW:+--tcp-allow "$OHMARCHY_VTEST_TCP_ALLOW"} "$sock" \
+                         < /dev/null > "$B/vtest.log" 2>&1 & ;;
+            *) nsenter -t "$P" -m -- "$vtest" --use-egl-surfaceless --socket-path "$sock" < /dev/null > "$B/vtest.log" 2>&1 & ;;
+            esac
+            i=0; while [ $i -lt 30 ] && ! nsenter -t "$P" -m -- test -S "$sock"; do sleep 0.1; i=$((i+1)); done
+        fi
+        nsenter -t "$P" -m -- chmod 666 "$sock"
+        cmd="HYPRLAND_SURFACELESS_GALLIUM_DRIVER=virpipe $cmd"
+        # The app presents each frame when Hyprland reads it back: one pixel will do.
+        case $vtest in *broker) cmd="HYPRLAND_READBACK_PRESENT=1 $cmd" ;; esac
+    fi
+    ;;
+-g)
+    shift; [ -n "$*" ] || { echo "omarchy: -g needs an app" >&2; exit 2; }
+    gui=1
+    # One socat bridge per session from a local waypipe socket to the VM's
+    # route-d-display listener (the host only connects out), then a detached
+    # waypipe server per app; it exits with the app. Log: $XDG_RUNTIME_DIR/route-d.log
+    vm=${ROUTE_D_VM:-172.16.100.2:7777}
+    cmd='s=$XDG_RUNTIME_DIR/route-d.sock p=$XDG_RUNTIME_DIR/route-d-bridge.pid l=$XDG_RUNTIME_DIR/route-d.log
+if ! { [ -S "$s" ] && kill -0 "$(cat "$p" 2>/dev/null)" 2>/dev/null; }; then
+    rm -f "$s"
+    setsid socat UNIX-LISTEN:"$s",fork TCP:'"$vm"' < /dev/null >> "$l" 2>&1 &
+    echo $! > "$p"
+    i=0; while [ ! -S "$s" ] && [ $i -lt 30 ]; do sleep 0.1; i=$((i+1)); done
+fi
+setsid waypipe --no-gpu --compress lz4 --socket "$s" server -- '"$*"' < /dev/null >> "$l" 2>&1 &
+echo "started $! (log: $l)"'
+    ;;
+esac
+
+sh "$B/arch.sh" start > /dev/null || { sh "$B/arch.sh" status; exit 1; }
+P=$(cat "$B/session.pid")
+pw=$(grep "^$user:" "/proc/$P/root/etc/passwd") || { echo "omarchy: no user $user" >&2; exit 1; }
+uid=$(echo "$pw" | cut -d: -f3)
+gid=$(echo "$pw" | cut -d: -f4)
+home=$(echo "$pw" | cut -d: -f6)
+
+# As root inside: runtime dir, pty owner, cwd; then switch user and groups
+# with coreutils chroot to / (setpriv fails: no PR_SET_KEEPCAPS; no PAM here).
+exec nsenter -t "$P" -m -p -- chroot "$R" /usr/bin/env -i \
+    HOME="$home" USER="$user" LOGNAME="$user" SHELL=/bin/bash \
+    TERM="${TERM:-xterm-256color}" COLORTERM="${COLORTERM:-truecolor}" \
+    LANG="${LANG:-en_US.UTF-8}" XDG_RUNTIME_DIR="/run/user/$uid" \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/bin \
+    /usr/bin/bash -c '
+uid=$1 gid=$2 user=$3 cmd=$4 gui=$5
+install -d -m 700 -o "$uid" -g "$gid" "$XDG_RUNTIME_DIR"
+t=$(tty 2>/dev/null) && chown "$uid" "$t" 2>/dev/null
+cd "$HOME" 2>/dev/null || cd /
+set -- /usr/bin/chroot --skip-chdir --userspec="$uid:$gid" --groups="$(id -G "$user" | tr " " ,)" / /usr/bin/bash -l
+# The pty is the controlling tty of a session outside this pid namespace;
+# without a session of its own bash gets no job control.
+[ -t 0 ] && [ "$gui" != 1 ] && set -- /usr/bin/setsid -w -c "$@"
+[ -n "$cmd" ] && exec "$@" -c "$cmd"
+exec "$@"' omarchy "$uid" "$gid" "$user" "$cmd" "$gui"
